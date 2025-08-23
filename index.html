@@ -1,0 +1,746 @@
+<!DOCTYPE html>
+
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>WebXR AR Boxing Game - Ragdoll Knockout</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <style>
+    body { 
+      margin: 0; 
+      overflow: hidden;
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background: #000;
+    }
+    #overlay {
+      position: absolute;
+      top: 20px;
+      left: 20px;
+      z-index: 1;
+    }
+    #start-button {
+      padding: 14px 28px;
+      font-size: 20px;
+      background: linear-gradient(135deg, #ff4444, #cc0000);
+      color: white;
+      border: none;
+      border-radius: 30px;
+      box-shadow: 0 6px 20px rgba(255,0,0,0.3);
+      cursor: pointer;
+      transition: all 0.3s ease;
+      font-weight: bold;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+    }
+    #start-button:hover {
+      transform: translateY(-2px) scale(1.05);
+      box-shadow: 0 8px 25px rgba(255,0,0,0.4);
+    }
+    #score-display {
+      position: fixed;
+      top: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(0, 0, 0, 0.7);
+      color: white;
+      padding: 10px 20px;
+      border-radius: 20px;
+      font-size: 24px;
+      font-weight: bold;
+      backdrop-filter: blur(10px);
+      z-index: 1000;
+      display: none;
+      text-align: center;
+    }
+    .xr-active #score-display {
+      display: block;
+    }
+    #status {
+      position: fixed;
+      bottom: 40px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(0, 0, 0, 0.7);
+      color: white;
+      padding: 12px 20px;
+      border-radius: 24px;
+      font-size: 16px;
+      font-weight: 500;
+      backdrop-filter: blur(10px);
+      box-shadow: 0 4px 6px rgba(0,0,0,0.2);
+      max-width: 80%;
+      text-align: center;
+      display: none;
+      z-index: 1000;
+    }
+    .exit-ar {
+      position: fixed;
+      top: 20px;
+      right: 20px;
+      background: rgba(255, 255, 255, 0.25);
+      color: white;
+      border: none;
+      border-radius: 50%;
+      width: 50px;
+      height: 50px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 24px;
+      cursor: pointer;
+      backdrop-filter: blur(5px);
+      box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+      z-index: 1000;
+      display: none;
+    }
+    .xr-active .exit-ar {
+      display: flex;
+    }
+    .combo-display {
+      position: fixed;
+      top: 80px;
+      left: 50%;
+      transform: translateX(-50%);
+      color: #ffcc00;
+      font-size: 32px;
+      font-weight: bold;
+      text-shadow: 2px 2px 4px rgba(0,0,0,0.8);
+      z-index: 1000;
+      display: none;
+      animation: comboPopup 0.5s ease-out;
+    }
+    @keyframes comboPopup {
+      0% { transform: translateX(-50%) scale(0.5); opacity: 0; }
+      50% { transform: translateX(-50%) scale(1.2); }
+      100% { transform: translateX(-50%) scale(1); opacity: 1; }
+    }
+  </style>
+</head>
+<body>
+  <div id="overlay">
+    <button id="start-button">Start Boxing 🥊</button>
+  </div>
+
+<button class="exit-ar" id="exit-ar">×</button>
+
+  <div id="score-display">
+    <div>KO Count: <span id="ko-count">0</span></div>
+    <div style="font-size: 16px; margin-top: 5px;">Combo: <span id="combo">0</span></div>
+  </div>
+  <div id="combo-display" class="combo-display"></div>
+  <div id="status"></div>
+
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.150.1/build/three.module.js';
+
+    // Game variables
+    let camera, scene, renderer;
+    let controllers = [];
+    let xrSession = null;
+    let koCount = 0;
+    let comboCount = 0;
+    let lastHitTime = 0;
+    
+    // Opponent management
+    let currentOpponent = null;
+    let opponentQueue = [];
+    let ragdollBodies = [];
+    const QUEUE_SIZE = 5;
+    const OPPONENT_SPACING = 0.7; // Increased spacing for better queue management
+    
+    // Physics simulation
+    const gravity = new THREE.Vector3(0, -9.8, 0);
+    const clock = new THREE.Clock();
+    
+    // Hit tracking to prevent duplicate hits
+    let lastHitOpponent = null;
+    let hitCooldown = 0;
+    let isMovingQueue = false; // Prevent overlapping queue movements
+    
+    // Ragdoll physics class
+    class RagdollBody {
+      constructor(mesh, initialVelocity) {
+        this.parts = [];
+        this.constraints = [];
+        this.group = new THREE.Group();
+        
+        // Create simplified ragdoll from stick figure
+        this.createFromStickFigure(mesh, initialVelocity);
+        this.isActive = true;
+        this.lifetime = 8.0; // Keep ragdolls longer for more impact
+      }
+      
+      createFromStickFigure(mesh, initialVelocity) {
+        const position = mesh.position.clone();
+        
+        // Head - much bigger
+        const headGeometry = new THREE.SphereGeometry(0.12, 12, 12);
+        const headMaterial = new THREE.MeshStandardMaterial({ color: 0xffaa88 });
+        const head = new THREE.Mesh(headGeometry, headMaterial);
+        head.position.copy(position).add(new THREE.Vector3(0, 0.5, 0));
+        
+        // Torso - much bigger
+        const torsoGeometry = new THREE.BoxGeometry(0.25, 0.4, 0.12);
+        const torsoMaterial = new THREE.MeshStandardMaterial({ color: 0x444444 });
+        const torso = new THREE.Mesh(torsoGeometry, torsoMaterial);
+        torso.position.copy(position).add(new THREE.Vector3(0, 0.2, 0));
+        
+        // Arms - much bigger
+        const armGeometry = new THREE.BoxGeometry(0.3, 0.08, 0.08);
+        const armMaterial = new THREE.MeshStandardMaterial({ color: 0xffaa88 });
+        const leftArm = new THREE.Mesh(armGeometry, armMaterial);
+        leftArm.position.copy(position).add(new THREE.Vector3(-0.18, 0.3, 0));
+        
+        const rightArm = new THREE.Mesh(armGeometry, armMaterial);
+        rightArm.position.copy(position).add(new THREE.Vector3(0.18, 0.3, 0));
+        
+        // Legs - much bigger
+        const legGeometry = new THREE.BoxGeometry(0.08, 0.3, 0.08);
+        const legMaterial = new THREE.MeshStandardMaterial({ color: 0x222222 });
+        const leftLeg = new THREE.Mesh(legGeometry, legMaterial);
+        leftLeg.position.copy(position).add(new THREE.Vector3(-0.08, -0.15, 0));
+        
+        const rightLeg = new THREE.Mesh(legGeometry, legMaterial);
+        rightLeg.position.copy(position).add(new THREE.Vector3(0.08, -0.15, 0));
+        
+        // Add parts to group
+        this.group.add(head, torso, leftArm, rightArm, leftLeg, rightLeg);
+        
+        // Create physics bodies for each part
+        this.parts = [
+          { mesh: head, velocity: initialVelocity.clone().multiplyScalar(1.2), angularVelocity: new THREE.Vector3(Math.random() * 10 - 5, Math.random() * 10 - 5, Math.random() * 10 - 5) },
+          { mesh: torso, velocity: initialVelocity.clone(), angularVelocity: new THREE.Vector3(Math.random() * 8 - 4, Math.random() * 8 - 4, Math.random() * 8 - 4) },
+          { mesh: leftArm, velocity: initialVelocity.clone().add(new THREE.Vector3(-0.8, 0.3, 0)), angularVelocity: new THREE.Vector3(Math.random() * 15 - 7.5, Math.random() * 15 - 7.5, Math.random() * 15 - 7.5) },
+          { mesh: rightArm, velocity: initialVelocity.clone().add(new THREE.Vector3(0.8, 0.3, 0)), angularVelocity: new THREE.Vector3(Math.random() * 15 - 7.5, Math.random() * 15 - 7.5, Math.random() * 15 - 7.5) },
+          { mesh: leftLeg, velocity: initialVelocity.clone().multiplyScalar(0.8), angularVelocity: new THREE.Vector3(Math.random() * 6 - 3, Math.random() * 6 - 3, Math.random() * 6 - 3) },
+          { mesh: rightLeg, velocity: initialVelocity.clone().multiplyScalar(0.8), angularVelocity: new THREE.Vector3(Math.random() * 6 - 3, Math.random() * 6 - 3, Math.random() * 6 - 3) }
+        ];
+        
+        // Add some randomness to make it more dynamic
+        this.parts.forEach(part => {
+          part.velocity.add(new THREE.Vector3(
+            (Math.random() - 0.5) * 0.8,
+            Math.random() * 0.5,
+            (Math.random() - 0.5) * 0.8
+          ));
+        });
+      }
+      
+      update(deltaTime) {
+        if (!this.isActive) return;
+        
+        this.lifetime -= deltaTime;
+        if (this.lifetime <= 0) {
+          this.isActive = false;
+          return;
+        }
+        
+        // Update each part
+        this.parts.forEach(part => {
+          // Apply gravity
+          part.velocity.add(gravity.clone().multiplyScalar(deltaTime));
+          
+          // Apply velocity
+          part.mesh.position.add(part.velocity.clone().multiplyScalar(deltaTime));
+          
+          // Apply angular velocity
+          part.mesh.rotation.x += part.angularVelocity.x * deltaTime;
+          part.mesh.rotation.y += part.angularVelocity.y * deltaTime;
+          part.mesh.rotation.z += part.angularVelocity.z * deltaTime;
+          
+          // Ground collision
+          if (part.mesh.position.y < -0.1) {
+            part.mesh.position.y = -0.1;
+            part.velocity.y *= -0.3; // Bounce with damping
+            part.velocity.x *= 0.7; // Friction
+            part.velocity.z *= 0.7;
+            part.angularVelocity.multiplyScalar(0.8);
+          }
+          
+          // Fade out near end of lifetime
+          if (this.lifetime < 2.0) {
+            part.mesh.material.opacity = this.lifetime / 2.0;
+            part.mesh.material.transparent = true;
+          }
+        });
+      }
+    }
+    
+    // Stick figure opponent class
+    class StickFigureOpponent {
+      constructor(position, index) {
+        this.group = new THREE.Group();
+        this.position = position.clone();
+        this.index = index;
+        this.isActive = true;
+        this.isCurrentOpponent = false;
+        this.wasHit = false;
+        
+        // Create stick figure
+        this.createStickFigure();
+        this.group.position.copy(position);
+      }
+      
+      createStickFigure() {
+        // Head - much bigger
+        const headGeometry = new THREE.SphereGeometry(0.13, 16, 16);
+        const headMaterial = new THREE.MeshStandardMaterial({ 
+          color: 0xffccaa,
+          roughness: 0.7,
+          metalness: 0.1
+        });
+        const head = new THREE.Mesh(headGeometry, headMaterial);
+        head.position.y = 0.5;
+        head.castShadow = true;
+        
+        // Body - much bigger
+        const bodyGeometry = new THREE.CylinderGeometry(0.08, 0.08, 0.4, 12);
+        const bodyMaterial = new THREE.MeshStandardMaterial({ 
+          color: 0x333333,
+          roughness: 0.8
+        });
+        const body = new THREE.Mesh(bodyGeometry, bodyMaterial);
+        body.position.y = 0.2;
+        body.castShadow = true;
+        
+        // Arms - much bigger
+        const armGeometry = new THREE.CylinderGeometry(0.04, 0.04, 0.3, 8);
+        const armMaterial = new THREE.MeshStandardMaterial({ 
+          color: 0xffccaa,
+          roughness: 0.7
+        });
+        
+        const leftArm = new THREE.Mesh(armGeometry, armMaterial);
+        leftArm.position.set(-0.15, 0.3, 0);
+        leftArm.rotation.z = Math.PI / 4;
+        leftArm.castShadow = true;
+        
+        const rightArm = new THREE.Mesh(armGeometry, armMaterial);
+        rightArm.position.set(0.15, 0.3, 0);
+        rightArm.rotation.z = -Math.PI / 4;
+        rightArm.castShadow = true;
+        
+        // Legs - much bigger
+        const legGeometry = new THREE.CylinderGeometry(0.04, 0.04, 0.3, 8);
+        const legMaterial = new THREE.MeshStandardMaterial({ 
+          color: 0x222222,
+          roughness: 0.8
+        });
+        
+        const leftLeg = new THREE.Mesh(legGeometry, legMaterial);
+        leftLeg.position.set(-0.08, -0.15, 0);
+        leftLeg.castShadow = true;
+        
+        const rightLeg = new THREE.Mesh(legGeometry, legMaterial);
+        rightLeg.position.set(0.08, -0.15, 0);
+        rightLeg.castShadow = true;
+        
+        // Boxing gloves - much bigger and more realistic shape
+        const gloveGeometry = new THREE.SphereGeometry(0.08, 12, 12);
+        const gloveMaterial = new THREE.MeshStandardMaterial({ 
+          color: 0xff0000,
+          roughness: 0.3,
+          metalness: 0.2
+        });
+        
+        const leftGlove = new THREE.Mesh(gloveGeometry, gloveMaterial);
+        leftGlove.position.set(-0.22, 0.3, 0.08);
+        leftGlove.scale.set(1.2, 0.9, 1.4); // More glove-like shape
+        
+        const rightGlove = new THREE.Mesh(gloveGeometry, gloveMaterial);
+        rightGlove.position.set(0.22, 0.3, 0.08);
+        rightGlove.scale.set(1.2, 0.9, 1.4); // More glove-like shape
+        
+        // Add all parts to group
+        this.group.add(head, body, leftArm, rightArm, leftLeg, rightLeg, leftGlove, rightGlove);
+        
+        // Store references
+        this.head = head;
+        this.body = body;
+        
+        // Scale up the entire figure for better visibility
+        this.group.scale.setScalar(1.3);
+      }
+      
+      update(deltaTime) {
+        if (!this.isActive) return;
+        
+        // Idle animation
+        if (this.isCurrentOpponent) {
+          // Boxing stance animation - more pronounced
+          this.group.rotation.y = Math.sin(Date.now() * 0.002) * 0.15;
+          this.head.position.y = 0.5 + Math.sin(Date.now() * 0.003) * 0.02;
+        } else {
+          // Waiting animation - subtle bobbing
+          this.group.position.y = Math.sin(Date.now() * 0.0015 + this.index) * 0.03;
+        }
+      }
+      
+      stepForward(targetPosition) {
+        // Animate stepping forward with better timing
+        this.isCurrentOpponent = true;
+        this.wasHit = false;
+        const startPos = this.group.position.clone();
+        const duration = 800; // Slightly longer for smoother movement
+        const startTime = Date.now();
+        
+        const animate = () => {
+          const elapsed = Date.now() - startTime;
+          const progress = Math.min(elapsed / duration, 1);
+          const eased = 1 - Math.pow(1 - progress, 3); // Ease out cubic
+          
+          this.group.position.lerpVectors(startPos, targetPosition, eased);
+          
+          if (progress < 1) {
+            requestAnimationFrame(animate);
+          } else {
+            // Mark animation complete
+            isMovingQueue = false;
+          }
+        };
+        
+        animate();
+      }
+    }
+
+    // Initialize WebXR components
+    function init() {
+      // Scene setup
+      scene = new THREE.Scene();
+      scene.fog = new THREE.Fog(0x000000, 1, 15);
+      
+      camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+      // Renderer setup
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.xr.enabled = true;
+      renderer.setClearColor(0x000000, 0);
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+      document.body.appendChild(renderer.domElement);
+
+      // Enhanced lighting for boxing arena feel
+      const ambientLight = new THREE.AmbientLight(0x404040, 1.8);
+      scene.add(ambientLight);
+
+      const spotLight = new THREE.SpotLight(0xffffff, 2.5);
+      spotLight.position.set(0, 3, 0);
+      spotLight.angle = Math.PI / 2.5;
+      spotLight.penumbra = 0.3;
+      spotLight.castShadow = true;
+      spotLight.shadow.camera.near = 0.1;
+      spotLight.shadow.camera.far = 10;
+      scene.add(spotLight);
+
+      const rimLight = new THREE.DirectionalLight(0x4488ff, 0.6);
+      rimLight.position.set(-1, 1, -1);
+      scene.add(rimLight);
+
+      // Handle window resize
+      window.addEventListener('resize', onWindowResize);
+
+      // Set up event listeners
+      document.getElementById('start-button').addEventListener('click', startARSession);
+      document.getElementById('exit-ar').addEventListener('click', endARSession);
+    }
+
+    // Create opponent queue
+    function createOpponentQueue() {
+      // Clear existing queue
+      opponentQueue.forEach(opponent => {
+        scene.remove(opponent.group);
+      });
+      opponentQueue = [];
+      isMovingQueue = false;
+      
+      // Create initial queue
+      setTimeout(() => {
+        for (let i = 0; i < QUEUE_SIZE; i++) {
+          const position = new THREE.Vector3(0, 0, -1.2 - (i * OPPONENT_SPACING));
+          position.y = 0;
+          
+          const opponent = new StickFigureOpponent(position, i);
+          opponentQueue.push(opponent);
+          scene.add(opponent.group);
+        }
+        
+        // Set first opponent as current
+        if (opponentQueue.length > 0) {
+          currentOpponent = opponentQueue[0];
+          currentOpponent.isCurrentOpponent = true;
+          lastHitOpponent = null;
+        }
+      }, 1200); // Give more time for XR to initialize
+    }
+    
+    // Spawn next opponent - FIXED VERSION
+    function spawnNextOpponent() {
+      if (isMovingQueue) return; // Prevent overlapping movements
+      
+      isMovingQueue = true;
+      
+      // Remove knocked out opponent from queue
+      if (currentOpponent) {
+        const index = opponentQueue.indexOf(currentOpponent);
+        if (index > -1) {
+          opponentQueue.splice(index, 1);
+        }
+      }
+      
+      // Move all existing opponents forward in sequence
+      opponentQueue.forEach((opponent, i) => {
+        const targetPos = new THREE.Vector3(0, 0, -1.2 - (i * OPPONENT_SPACING));
+        targetPos.y = 0;
+        
+        if (i === 0) {
+          // First opponent becomes the new current opponent
+          opponent.stepForward(targetPos);
+          currentOpponent = opponent;
+          currentOpponent.isCurrentOpponent = true;
+          lastHitOpponent = null;
+        } else {
+          // Other opponents move smoothly to their new positions
+          const startPos = opponent.group.position.clone();
+          const duration = 800;
+          const startTime = Date.now();
+          
+          const animate = () => {
+            const elapsed = Date.now() - startTime;
+            const progress = Math.min(elapsed / duration, 1);
+            const eased = 1 - Math.pow(1 - progress, 3);
+            
+            opponent.group.position.lerpVectors(startPos, targetPos, eased);
+            
+            if (progress < 1) {
+              requestAnimationFrame(animate);
+            }
+          };
+          
+          animate();
+        }
+        
+        opponent.isCurrentOpponent = (i === 0);
+      });
+      
+      // Add new opponent at the back of the queue
+      const backPosition = new THREE.Vector3(0, 0, -1.2 - ((QUEUE_SIZE - 1) * OPPONENT_SPACING));
+      backPosition.y = 0;
+      
+      const newOpponent = new StickFigureOpponent(backPosition, QUEUE_SIZE - 1);
+      opponentQueue.push(newOpponent);
+      scene.add(newOpponent.group);
+      
+      // Reset moving flag after animations complete
+      setTimeout(() => {
+        isMovingQueue = false;
+      }, 1000);
+    }
+    
+    // Handle punch hit
+    function handlePunchHit(controller) {
+      if (!currentOpponent || !currentOpponent.isActive || currentOpponent.wasHit || isMovingQueue) return;
+      
+      // Check hit cooldown
+      if (hitCooldown > 0) return;
+      
+      const controllerPos = new THREE.Vector3();
+      controller.getWorldPosition(controllerPos);
+      
+      const opponentPos = currentOpponent.group.position;
+      const distance = controllerPos.distanceTo(opponentPos);
+      
+      // Check if punch is close enough to hit - adjusted for larger characters
+      if (distance < 0.6) {
+        // Mark this opponent as hit to prevent duplicate hits
+        currentOpponent.wasHit = true;
+        lastHitOpponent = currentOpponent;
+        hitCooldown = 0.8; // Longer cooldown for better control
+        
+        // Calculate impact force and direction
+        const impactDirection = new THREE.Vector3()
+          .subVectors(opponentPos, controllerPos)
+          .normalize();
+        
+        // Add upward component for more dramatic effect
+        impactDirection.y += 0.6;
+        impactDirection.normalize();
+        
+        // Calculate impact force based on controller velocity (simulated)
+        const impactForce = 2.5 + Math.random() * 2;
+        const impactVelocity = impactDirection.multiplyScalar(impactForce);
+        
+        // Create ragdoll
+        const ragdoll = new RagdollBody(currentOpponent.group, impactVelocity);
+        ragdollBodies.push(ragdoll);
+        scene.add(ragdoll.group);
+        
+        // Remove original opponent
+        scene.remove(currentOpponent.group);
+        currentOpponent.isActive = false;
+        
+        // Update score
+        koCount++;
+        document.getElementById('ko-count').textContent = koCount;
+        
+        // Update combo
+        const currentTime = Date.now();
+        if (currentTime - lastHitTime < 3000) { // 3 second combo window
+          comboCount++;
+          showComboPopup(comboCount);
+        } else {
+          comboCount = 1;
+        }
+        lastHitTime = currentTime;
+        document.getElementById('combo').textContent = comboCount;
+        
+        // Haptic feedback if available
+        if (controller.gamepad && controller.gamepad.hapticActuators) {
+          controller.gamepad.hapticActuators[0].pulse(0.9, 150);
+        }
+        
+        // Spawn next opponent with proper delay
+        setTimeout(() => {
+          spawnNextOpponent();
+        }, 1000);
+        
+        updateStatus(`KO! Combo x${comboCount}`);
+      }
+    }
+    
+    // Show combo popup
+    function showComboPopup(combo) {
+      if (combo < 3) return;
+      
+      const comboDisplay = document.getElementById('combo-display');
+      comboDisplay.textContent = `${combo}x COMBO!`;
+      comboDisplay.style.display = 'block';
+      
+      setTimeout(() => {
+        comboDisplay.style.display = 'none';
+      }, 2000);
+    }
+
+    // Start AR session
+    function startARSession() {
+      if (!navigator.xr) {
+        updateStatus('WebXR is not supported in this browser.');
+        return;
+      }
+      
+      navigator.xr.isSessionSupported('immersive-ar').then((supported) => {
+        if (supported) {
+          const sessionInit = { 
+            requiredFeatures: ['hit-test'],
+            optionalFeatures: ['dom-overlay', 'hand-tracking'], 
+            domOverlay: { root: document.body } 
+          };
+          
+          navigator.xr.requestSession('immersive-ar', sessionInit).then(onSessionStarted);
+        } else {
+          updateStatus('WebXR AR session is not supported on this device.');
+        }
+      });
+    }
+
+    // Handle AR session start
+    function onSessionStarted(session) {
+      xrSession = session;
+      
+      // Hide start button
+      document.getElementById('start-button').style.display = 'none';
+      
+      // Set up XR scene
+      renderer.xr.setReferenceSpaceType('local');
+      renderer.xr.setSession(session);
+      
+      // Add XR active class to body
+      document.body.classList.add('xr-active');
+      
+      // Reset game state
+      koCount = 0;
+      comboCount = 0;
+      hitCooldown = 0;
+      lastHitOpponent = null;
+      isMovingQueue = false;
+      document.getElementById('ko-count').textContent = '0';
+      document.getElementById('combo').textContent = '0';
+      
+      // Set up controllers
+      setupControllers(session);
+      
+      // Create opponent queue after a delay
+      createOpponentQueue();
+      
+      // Start animation loop
+      renderer.setAnimationLoop(render);
+      
+      // Handle session end
+      session.addEventListener('end', onSessionEnd);
+      
+      updateStatus('Ready to fight! Throw punches to knock out opponents!');
+    }
+    
+    // End AR session
+    function endARSession() {
+      if (xrSession) {
+        xrSession.end();
+      }
+    }
+    
+    function onSessionEnd() {
+      // Remove XR active class from body
+      document.body.classList.remove('xr-active');
+      
+      // Show start button again
+      document.getElementById('start-button').style.display = 'block';
+      
+      // Clear status
+      document.getElementById('status').style.display = 'none';
+      
+      // Stop animation loop
+      renderer.setAnimationLoop(null);
+      xrSession = null;
+      
+      // Clear scene
+      clearScene();
+      
+      // Reset state
+      controllers = [];
+      currentOpponent = null;
+      opponentQueue = [];
+      ragdollBodies = [];
+      hitCooldown = 0;
+      lastHitOpponent = null;
+      isMovingQueue = false;
+    }
+    
+    function clearScene() {
+      // Remove all objects from scene except lights
+      const objectsToRemove = [];
+      scene.traverse((object) => {
+        if (object.type === 'Mesh' || object.type === 'Group') {
+          objectsToRemove.push(object);
+        }
+      });
+      
+      objectsToRemove.forEach(object => {
+        if (object.geometry) object.geometry.dispose();
+        if (object.material) {
+          if (Array.isArray(object.material)) {
+            object.material.forEach(m => m.dispose());
+          } else {
+            object.material.dispose();
+          }
+        }
+        if (object.parent) {
+          object.parent.remove(object);
+        }
+      });
+    }
+
+    function setupControllers(session) {
+      // Set up controllers (hands/gloves)
+      for (let i = 0; i < 2; i++) {
